@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Daily Cumulative kWh Tracker</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+<style>
+  :root { --bg:#0b1320; --panel:#121a2a; --ink:#e8eefc; --muted:#9fb0ce; }
+
+  /* Layout: full viewport height, no scroll needed for chart */
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink); font:14px/1.4 system-ui,Segoe UI,Roboto,Arial }
+  header { padding:14px 18px; border-bottom:1px solid #1e2b48 }
+  header h1 { margin:0; font-size:18px }
+  header .small { color:var(--muted) }
+
+  main {
+    display:grid; grid-template-columns:420px 1fr; gap:14px;
+    padding:14px; height:calc(100vh - 60px); /* header ≈ 60px */
+    box-sizing:border-box;
+  }
+  @media (max-width: 980px){ main{ grid-template-columns:1fr; height:auto; min-height:calc(100vh - 60px); } }
+
+  .card { background:var(--panel); border:1px solid #1e2b48; border-radius:12px; display:flex; flex-direction:column; min-height:0; }
+  .card h2 { margin:0; padding:10px 12px; border-bottom:1px solid #1e2b48; font-size:14px; color:#cfe0ff }
+  .card .body { padding:10px 12px; display:flex; flex-direction:column; gap:10px; min-height:0; }
+
+  .row { display:flex; flex-wrap:wrap; gap:8px }
+  input,button { background:#0e1730; border:1px solid #263a63; color:var(--ink); padding:8px 10px; border-radius:8px }
+  input[type="date"]{ min-width:150px }
+  input[type="number"]{ width:160px }
+  button { cursor:pointer }
+  button.primary { background:#1a63ff; border-color:#1a63ff }
+  button.ghost { background:transparent; border-color:#2a3d67 }
+
+  table { width:100%; border-collapse:separate; border-spacing:0 6px }
+  th,td { padding:8px 10px; text-align:left; vertical-align:middle; }
+  th { color:#cfe0ff; font-weight:600 }
+  tr { background:#0c1326; border-radius:8px }
+  tr td:first-child{ border-top-left-radius:8px; border-bottom-left-radius:8px }
+  tr td:last-child{ border-top-right-radius:8px; border-bottom-right-radius:8px }
+
+  .small { color:var(--muted); font-size:12px }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#0d1d3e; border:1px solid #28457a; color:#bcd1ff }
+  .neg { color:#ffb1b1; } /* negative daily delta */
+
+  /* Chart fills the right card without scrolling */
+  .chart-wrap { flex:1; display:flex; min-height:0 }
+  #chart { flex:1; min-height:240px; border:1px solid #1e2b48; border-radius:10px; background:#0c1326 }
+</style>
+</head>
+<body>
+<header>
+  <h1>Daily Cumulative kWh Tracker</h1>
+  <div class="small">Add a row per day. Chart updates live. Data is saved in your browser.</div>
+</header>
+
+<main>
+  <!-- Left: Controls + Table -->
+  <section class="card">
+    <h2>Data Entry</h2>
+    <div class="body">
+      <div class="row">
+        <input id="dateInput" type="date" />
+        <input id="kwhInput" type="number" step="0.1" min="0" placeholder="Cumulative kWh" />
+        <button id="addBtn" class="primary">Add / Update</button>
+        <button id="todayBtn" class="ghost">Today</button>
+      </div>
+      <div class="row">
+        <input id="csvFile" type="file" accept=".csv" />
+        <button id="importBtn">Import CSV</button>
+        <button id="exportBtn" class="ghost">Export CSV</button>
+        <button id="clearBtn" class="ghost">Clear All</button>
+        <span class="pill" id="summaryPill">0 rows</span>
+      </div>
+
+      <table id="dataTable">
+        <thead>
+          <tr><th>Date</th><th>Cumulative kWh</th><th>Daily Δ kWh</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+
+      <div class="small">Tips: Dates must be unique; values should be cumulative (non-decreasing). Click a row to edit.</div>
+    </div>
+  </section>
+
+  <!-- Right: Chart -->
+  <section class="card">
+    <h2>Chart & Regression</h2>
+    <div class="body" style="gap:8px">
+      <div class="chart-wrap"><canvas id="chart"></canvas></div>
+      <div class="small">Regression: <span id="eqn">—</span> &nbsp;|&nbsp; R²: <span id="r2">—</span></div>
+    </div>
+  </section>
+</main>
+
+<script>
+/* ========= Storage & Utilities ========= */
+const STORAGE_KEY = "kwh_rows_v3_fit";
+function loadRows(){ try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) ?? []; } catch { return []; } }
+function saveRows(rows){ localStorage.setItem(STORAGE_KEY, JSON.stringify(rows)); }
+function fmtDate(d){ const dt=new Date(d); const m=String(dt.getMonth()+1).padStart(2,'0'); const day=String(dt.getDate()).padStart(2,'0'); return `${dt.getFullYear()}-${m}-${day}`; }
+function parseDate(val){ return new Date(val); }
+
+/* ========= Regression (least squares) ========= */
+function regressionXY(xs, ys){
+  const n=xs.length; if(!n) return {m:0,b:0,r2:0};
+  let sumX=0,sumY=0,sumXY=0,sumXX=0;
+  for(let i=0;i<n;i++){ const x=xs[i], y=ys[i]; sumX+=x; sumY+=y; sumXY+=x*y; sumXX+=x*x; }
+  const denom = (n*sumXX - sumX*sumX) || 1;
+  const m=(n*sumXY - sumX*sumY)/denom;
+  const b=(sumY - m*sumX)/n;
+  const ybar=sumY/n; let ssTot=0, ssRes=0;
+  for(let i=0;i<n;i++){ const yi=ys[i]; const fi=m*xs[i]+b; ssTot+=(yi-ybar)**2; ssRes+=(yi-fi)**2; }
+  const r2= ssTot===0 ? 1 : 1 - (ssRes/ssTot);
+  return {m,b,r2};
+}
+
+/* ========= Table handling (with daily delta) ========= */
+const tbody=document.querySelector("#dataTable tbody");
+const summaryPill=document.getElementById("summaryPill");
+
+function computeDailyDeltas(sortedRows){
+  const deltas=[];
+  for(let i=0;i<sortedRows.length;i++){
+    if(i===0){ deltas.push(null); continue; }
+    deltas.push(Number(sortedRows[i].kwh) - Number(sortedRows[i-1].kwh));
+  }
+  return deltas;
+}
+
+function renderTable(rows){
+  rows.sort((a,b)=> new Date(a.date) - new Date(b.date));
+  const deltas = computeDailyDeltas(rows);
+
+  tbody.innerHTML="";
+  rows.forEach((r,idx)=>{
+    const tr=document.createElement("tr");
+    const tdDate=document.createElement("td");
+    const tdKwh=document.createElement("td");
+    const tdDelta=document.createElement("td");
+    const tdAct=document.createElement("td");
+
+    tdDate.textContent=new Date(r.date).toLocaleDateString();
+    tdKwh.textContent=Number(r.kwh).toFixed(1);
+
+    const d = deltas[idx];
+    if (d === null) {
+      tdDelta.textContent = "—";
+    } else {
+      tdDelta.textContent = (Math.round(d*10)/10).toFixed(1);
+      if (d < 0) tdDelta.classList.add("neg");
+    }
+
+    const delBtn=document.createElement("button");
+    delBtn.className="ghost"; delBtn.textContent="Delete";
+    delBtn.onclick=()=>{ rows.splice(idx,1); saveRows(rows); updateAll(); };
+
+    tdAct.appendChild(delBtn);
+    tr.appendChild(tdDate); tr.appendChild(tdKwh); tr.appendChild(tdDelta); tr.appendChild(tdAct);
+
+    tr.style.cursor="pointer"; tr.title="Click to load into form";
+    tr.onclick=(e)=>{ if(e.target===delBtn) return; dateInput.value=fmtDate(r.date); kwhInput.value=r.kwh; };
+
+    tbody.appendChild(tr);
+  });
+  summaryPill.textContent=`${rows.length} row${rows.length===1?"":"s"}`;
+}
+
+/* ========= Chart ========= */
+const ctx=document.getElementById("chart");
+let chart;
+function buildChart(rows){
+  const labels=rows.map(r=>new Date(r.date));
+  const dataY=rows.map(r=>Number(r.kwh));
+  const xs=dataY.map((_,i)=>i);
+  const {m,b,r2}=regressionXY(xs,dataY);
+  const trend=xs.map(i=>m*i+b);
+
+  if(chart) chart.destroy();
+  chart=new Chart(ctx,{
+    type:"line",
+    data:{
+      labels,
+      datasets:[
+        {label:"Observed kWh", data:dataY, borderWidth:2, tension:0.2, pointRadius:3},
+        {label:"Trend Line", data:trend, borderDash:[6,6], borderWidth:2, pointRadius:0}
+      ]
+    },
+    options:{
+      responsive:true,
+      maintainAspectRatio:false, /* let the canvas flex to fill the card */
+      scales:{
+        x:{ type:"time", time:{unit:"day"}, ticks:{color:"#cfe0ff"}, grid:{color:"#1e2b48"} },
+        y:{ ticks:{color:"#cfe0ff"}, grid:{color:"#1e2b48"} }
+      },
+      plugins:{ legend:{labels:{color:"#cfe0ff"}}, tooltip:{mode:"index",intersect:false} }
+    }
+  });
+
+  document.getElementById("eqn").textContent=`y = ${m.toFixed(2)}x + ${b.toFixed(2)}`;
+  document.getElementById("r2").textContent=r2.toFixed(4);
+}
+
+/* ========= Import/Export ========= */
+function toCSV(rows){
+  const header="date,kwh\n";
+  const body=rows.map(r=>`${new Date(r.date).toISOString().slice(0,10)},${Number(r.kwh)}`).join("\n");
+  return header+body;
+}
+function download(filename,text){
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([text],{type:"text/csv"}));
+  a.download=filename; a.click(); URL.revokeObjectURL(a.href);
+}
+async function importCSV(file, rows){
+  const text=await file.text();
+  const lines=text.trim().split(/\r?\n/);
+  if(!/^date,kwh/i.test(lines[0])) { alert("CSV must start with header: date,kwh"); return; }
+  const map=new Map(rows.map(r=>[new Date(r.date).toDateString(), r.kwh]));
+  for(let i=1;i<lines.length;i++){
+    const [d,k]=lines[i].split(",");
+    const dt=new Date(d.trim()); const kv=Number(k);
+    if(Number.isFinite(dt.getTime()) && Number.isFinite(kv)){ map.set(dt.toDateString(), kv); }
+  }
+  const merged=[...map.entries()].map(([ds,kv])=>({date:new Date(ds), kwh:kv})).sort((a,b)=>+a.date-+b.date);
+  saveRows(merged); updateAll();
+}
+
+/* ========= Wire up UI ========= */
+const dateInput=document.getElementById("dateInput");
+const kwhInput=document.getElementById("kwhInput");
+document.getElementById("todayBtn").onclick=()=> dateInput.value=fmtDate(new Date());
+
+document.getElementById("addBtn").onclick=()=>{
+  const d=parseDate(dateInput.value);
+  const kv=Number(kwhInput.value);
+  if(!dateInput.value) return alert("Please choose a date.");
+  if(!Number.isFinite(kv)) return alert("Please enter a numeric kWh value.");
+
+  const rows=loadRows();
+  const key=d.toDateString();
+  const idx=rows.findIndex(r=>new Date(r.date).toDateString()===key);
+  const newRow={date:d, kwh:kv};
+  if(idx>=0) rows[idx]=newRow; else rows.push(newRow);
+
+  // warn if decreasing vs previous
+  const sorted=rows.slice().sort((a,b)=>+new Date(a.date)-+new Date(b.date));
+  const j=sorted.findIndex(r=>new Date(r.date).toDateString()===key);
+  if(j>0 && kv<sorted[j-1].kwh){
+    if(!confirm("Value is less than the previous day's cumulative total. Keep it?")) return;
+  }
+
+  saveRows(rows); updateAll();
+};
+
+document.getElementById("clearBtn").onclick=()=>{ if(confirm("Clear all data?")){ saveRows([]); updateAll(); } };
+document.getElementById("exportBtn").onclick=()=> download("kwh_data.csv", toCSV(loadRows()));
+document.getElementById("importBtn").onclick=()=>{
+  const f=document.getElementById("csvFile").files[0];
+  if(!f) return alert("Choose a CSV file first.");
+  importCSV(f, loadRows());
+};
+
+/* ========= App init ========= */
+function updateAll(){ const rows=loadRows(); renderTable(rows); buildChart(rows); }
+(function bootstrap(){
+  if(loadRows().length===0){
+    const seed=[
+      ["2025-08-09",704.4],["2025-08-10",706.3],["2025-08-11",707.6],["2025-08-12",710.3],
+      ["2025-08-13",712.1],["2025-08-14",712.7],["2025-08-16",713.3],["2025-08-17",714.0],
+      ["2025-08-18",714.5],["2025-08-19",716.4],["2025-08-20",717.8],["2025-08-21",718.8],
+      ["2025-08-22",720.3],
+    ].map(([d,k])=>({date:new Date(d), kwh:k}));
+    saveRows(seed);
+  }
+  updateAll();
+})();
+</script>
+</body>
+</html>
